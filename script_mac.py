@@ -1,207 +1,222 @@
 import psutil
 import time
 import csv
-from datetime import datetime
-import subprocess
 import platform
+import subprocess
+from datetime import datetime
+from collections import deque
 
+# --- CONFIGURATION ---
 SYSTEM_ID = "S1"
-OUTPUT_FILE = "system_S1.csv"
-SAMPLING_INTERVAL = 1          # seconds
-DURATION = 1800                # 30 minutes
+OUTPUT_FILE = f"system_{SYSTEM_ID}.csv"
+SAMPLING_INTERVAL = 1.0     # seconds
+DURATION = 1800             # 30 minutes
+IDLE_THRESHOLD = 5.0        # CPU % considered idle
+
+# --- PLATFORM CHECK ---
+if platform.system() != "Darwin":
+    print("ERROR: This script is for macOS only.")
+    exit(1)
+
+# --- ROLLING BUFFERS ---
+cpu_util_10s = deque(maxlen=10)
+cpu_util_30s = deque(maxlen=30)
+cpu_util_60s = deque(maxlen=60)
+cpu_temp_hist = deque(maxlen=5)
+
+last_idle_time = time.time()
+
+# Seed psutil CPU percent
+psutil.cpu_percent(interval=None)
+
+freq = psutil.cpu_freq()
+CLOCK_SPEED_MAX = freq.max if freq else 0.0
 
 
+# --- CPU TEMPERATURE (macOS) ---
 def get_cpu_temperature_mac():
-    """
-    Get CPU temperature on macOS using multiple methods
-    """
-    # Method 1: Try psutil sensors (works on some Macs)
+    # Method 1: psutil (rarely works)
     try:
         temps = psutil.sensors_temperatures()
         if temps:
-            for name, entries in temps.items():
+            for entries in temps.values():
                 for entry in entries:
                     if entry.current is not None:
                         return round(entry.current, 2)
-    except:
+    except Exception:
         pass
-    
-    # Method 2: Try osx-cpu-temp command (if installed)
+
+    # Method 2: osx-cpu-temp (recommended)
     try:
         result = subprocess.run(
-            ['osx-cpu-temp'],
+            ["osx-cpu-temp"],
             capture_output=True,
             text=True,
             timeout=2
         )
         if result.returncode == 0:
-            # Output format: "61.2°C"
-            temp_str = result.stdout.strip()
-            temp_value = float(temp_str.replace('°C', '').strip())
-            return round(temp_value, 2)
-    except:
+            return round(float(result.stdout.replace("°C", "").strip()), 2)
+    except Exception:
         pass
-    
-    # Method 3: Try powermetrics (requires sudo, so likely won't work)
+
+    # Method 3: istats
     try:
         result = subprocess.run(
-            ['powermetrics', '--samplers', 'smc', '-i1', '-n1'],
-            capture_output=True,
-            text=True,
-            timeout=3
-        )
-        if result.returncode == 0:
-            # Parse output for CPU temperature
-            for line in result.stdout.split('\n'):
-                if 'CPU die temperature' in line:
-                    temp_value = float(line.split(':')[1].strip().split()[0])
-                    return round(temp_value, 2)
-    except:
-        pass
-    
-    # Method 4: Try istats (if installed via gem install iStats)
-    try:
-        result = subprocess.run(
-            ['istats', 'cpu', 'temp', '--value-only'],
+            ["istats", "cpu", "temp", "--value-only"],
             capture_output=True,
             text=True,
             timeout=2
         )
         if result.returncode == 0:
-            temp_value = float(result.stdout.strip())
-            return round(temp_value, 2)
-    except:
+            return round(float(result.stdout.strip()), 2)
+    except Exception:
         pass
-    
+
     return None
 
 
+# --- POWER ESTIMATION ---
 def get_voltage_current(cpu_util):
-    """
-    Estimate voltage and current on macOS
-    """
     battery = psutil.sensors_battery()
     if battery:
-        # MacBook battery voltage
         voltage = 11.4 if battery.power_plugged else 11.1
         current = 1.5 + (cpu_util / 100.0) * 3.5
     else:
-        # Mac desktop (iMac, Mac Mini, Mac Studio)
         voltage = 12.0
         current = 2.0 + (cpu_util / 100.0) * 8.0
-    
     return round(voltage, 2), round(current, 2)
 
 
+# --- AMBIENT TEMPERATURE ---
 def get_ambient_temperature(cpu_temp):
-    """
-    Estimate ambient temperature
-    Estimated as CPU temp minus ~12°C (typical delta)
-    """
     if cpu_temp is not None:
-        ambient = cpu_temp - 12
-        return round(ambient, 2)
+        return round(cpu_temp - 12.0, 2)
     return 25.0
 
 
-# Verify we're on macOS
-if platform.system() != 'Darwin':
-    print("ERROR: This script is for macOS only!")
-    print("For Windows, use script_windows.py")
-    exit(1)
-
-print(f"Initializing data collection for {SYSTEM_ID}...")
-print("Detecting CPU temperature method for macOS...")
+# --- START ---
+print(f"Initializing macOS data collection for {SYSTEM_ID}")
 print("=" * 60)
 
-# Test temperature reading
 test_temp = get_cpu_temperature_mac()
-
 if test_temp is None:
-    print("⚠️  WARNING: Could not detect CPU temperature!")
-    print("")
-    print("To enable temperature reading on macOS, install one of these:")
-    print("")
-    print("Option 1: osx-cpu-temp (Recommended)")
+    print("⚠️  CPU temperature not detected.")
+    print("Install one of the following:")
     print("  brew install osx-cpu-temp")
-    print("")
-    print("Option 2: iStats")
     print("  sudo gem install iStats")
-    print("")
-    print("After installation, run this script again.")
-    print("=" * 60)
-    
-    response = input("\nContinue WITHOUT temperature data? (y/n): ")
-    if response.lower() != 'y':
-        print("Exiting. Please install temperature monitoring tool first.")
+    choice = input("Continue WITHOUT CPU temperature? (y/n): ")
+    if choice.lower() != "y":
         exit(1)
-    print("\n⚠️  Proceeding without CPU temperature (will be None in CSV)")
 else:
     print(f"✓ CPU Temperature detected: {test_temp}°C")
 
 print("=" * 60)
 
-
 with open(OUTPUT_FILE, mode="w", newline="") as file:
     writer = csv.writer(file)
 
+    # --- CSV HEADER (MATCHES WINDOWS SCRIPT) ---
     writer.writerow([
         "timestamp",
         "cpu_util",
+        "cpu_util_avg_10s",
+        "cpu_util_avg_30s",
+        "cpu_util_avg_60s",
+        "cpu_util_peak_10s",
+        "cpu_util_var_30s",
         "mem_util",
         "clock_speed",
+        "clock_speed_max",
         "cpu_temp",
+        "cpu_temp_prev_1s",
+        "cpu_temp_prev_5s",
         "ambient_temp",
         "voltage",
         "current",
+        "power_estimated",
+        "power_source",
+        "time_since_idle",
         "system_id"
     ])
 
     start_time = time.time()
-    print(f"Starting data collection for {SYSTEM_ID}...")
-    print(f"Duration: {DURATION // 60} minutes")
-    print("-" * 60)
 
-    while time.time() - start_time < DURATION:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        elapsed = time.time() - start_time
+    try:
+        while (time.time() - start_time) < DURATION:
+            loop_start = time.time()
 
-        cpu_util = psutil.cpu_percent(interval=None)
-        mem_util = psutil.virtual_memory().percent
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cpu_util = psutil.cpu_percent(interval=None)
+            mem_util = psutil.virtual_memory().percent
 
-        freq = psutil.cpu_freq()
-        clock_speed = freq.current if freq else None
+            freq = psutil.cpu_freq()
+            clock_speed = freq.current if freq else 0.0
 
-        cpu_temp = get_cpu_temperature_mac()
-        ambient_temp = get_ambient_temperature(cpu_temp)
+            cpu_temp = get_cpu_temperature_mac()
+            ambient_temp = get_ambient_temperature(cpu_temp)
 
-        voltage, current = get_voltage_current(cpu_util)
+            battery = psutil.sensors_battery()
+            power_source = 1 if (not battery or battery.power_plugged) else 0
 
-        writer.writerow([
-            timestamp,
-            cpu_util,
-            mem_util,
-            clock_speed,
-            cpu_temp,
-            ambient_temp,
-            voltage,
-            current,
-            SYSTEM_ID
-        ])
+            voltage, current = get_voltage_current(cpu_util)
+            power_estimated = round(voltage * current, 2)
 
-        progress = (elapsed / DURATION) * 100
+            if cpu_util < IDLE_THRESHOLD:
+                last_idle_time = time.time()
+            time_since_idle = round(time.time() - last_idle_time, 2)
 
-        temp_display = f"{cpu_temp:5.1f}°C" if cpu_temp else "  N/A  "
-        
-        print(
-            f"\rProgress: {progress:5.1f}% | "
-            f"CPU: {cpu_util:5.1f}% | "
-            f"Temp: {temp_display}",
-            end="",
-            flush=True
-        )
+            cpu_util_10s.append(cpu_util)
+            cpu_util_30s.append(cpu_util)
+            cpu_util_60s.append(cpu_util)
 
-        time.sleep(SAMPLING_INTERVAL)
+            avg_10s = round(sum(cpu_util_10s) / len(cpu_util_10s), 2)
+            avg_30s = round(sum(cpu_util_30s) / len(cpu_util_30s), 2)
+            avg_60s = round(sum(cpu_util_60s) / len(cpu_util_60s), 2)
+            peak_10s = round(max(cpu_util_10s), 2)
+            var_30s = round(
+                sum((x - avg_30s) ** 2 for x in cpu_util_30s) / len(cpu_util_30s), 2
+            )
 
-print("\n" + "-" * 60)
+            temp_prev_1s = cpu_temp_hist[-1] if len(cpu_temp_hist) >= 1 else None
+            temp_prev_5s = cpu_temp_hist[0] if len(cpu_temp_hist) == 5 else None
+            if cpu_temp is not None:
+                cpu_temp_hist.append(cpu_temp)
+
+            writer.writerow([
+                timestamp,
+                cpu_util,
+                avg_10s,
+                avg_30s,
+                avg_60s,
+                peak_10s,
+                var_30s,
+                mem_util,
+                clock_speed,
+                CLOCK_SPEED_MAX,
+                cpu_temp,
+                temp_prev_1s,
+                temp_prev_5s,
+                ambient_temp,
+                voltage,
+                current,
+                power_estimated,
+                power_source,
+                time_since_idle,
+                SYSTEM_ID
+            ])
+
+            temp_str = f"{cpu_temp:.1f}°C" if cpu_temp else "N/A"
+            print(
+                f"\r[{SYSTEM_ID}] CPU: {cpu_util:5.1f}% | Temp: {temp_str:>6} | IdleΔ: {time_since_idle:6.1f}s",
+                end="",
+                flush=True
+            )
+
+            elapsed = time.time() - loop_start
+            time.sleep(max(0, SAMPLING_INTERVAL - elapsed))
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+
+print("\n" + "=" * 60)
 print(f"Data collection completed. Saved to {OUTPUT_FILE}")
